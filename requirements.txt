@@ -1,0 +1,25 @@
+# ─── Core Vision & Processing ───────────────────────────────────────────────
+opencv-python>=4.9.0
+numpy>=1.26.0
+Pillow>=10.3.0
+matplotlib>=3.8.0
+
+# ─── 3D Reconstruction ──────────────────────────────────────────────────────
+open3d>=0.18.0
+scipy>=1.13.0
+
+# ─── Deep Learning (CPU; swap index URL below for CUDA) ─────────────────────
+# For CUDA 12.1: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+torch>=2.3.0
+torchvision>=0.18.0
+
+# ─── Depth Estimation ───────────────────────────────────────────────────────
+transformers>=4.41.0          # HuggingFace hub (DepthAnything v2 weights)
+huggingface_hub>=0.23.0
+
+# ─── Optional visualisation ─────────────────────────────────────────────────
+pyvista>=0.43.0
+trimesh>=4.3.0
+
+# ─── Utilities ──────────────────────────────────────────────────────────────
+tqdm>=4.66.0
