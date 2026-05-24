@@ -33,6 +33,10 @@ parser.add_argument("--calib",      default="calibration.npz",
                     help="Calibration file from phase2_capture.py calibrate")
 parser.add_argument("--voxel",      type=float, default=0.005,
                     help="Voxel down-sample size in metres (default 0.005)")
+parser.add_argument("--depth-min",  type=float, default=0.2,
+                    help="Minimum depth in metres (default 0.2)")
+parser.add_argument("--depth-max",  type=float, default=1.5,
+                    help="Maximum depth in metres (default 1.5)")
 parser.add_argument("--mesh",       action="store_true",
                     help="Run Poisson surface reconstruction and export mesh")
 parser.add_argument("--out",        default="scene.ply",
@@ -65,17 +69,31 @@ def load_intrinsics() -> tuple[float, float, float, float]:
 def depth_to_cloud(depth: np.ndarray,
                    fx: float, fy: float,
                    cx: float, cy: float,
-                   depth_trunc: float = 10.0) -> o3d.geometry.PointCloud:
-    # ── Normalize relative depth (0-255) to metric guess (0.5m - 3.0m) ──
-    z = depth.astype(np.float64)
-    if z.max() > 10.0: # If it's in 0-255 range
-        z = 0.5 + (z / 255.0) * 2.5 
-    
+                   d_min: float = 0.2,
+                   d_max: float = 1.0) -> o3d.geometry.PointCloud:
+    # ── [Improvement] Non-linear Inverse Depth ──
+    # AI models usually predict disparity/inverse depth. 
+    # Linear mapping causes distortions; inverse mapping is physically truer.
+    z_raw = depth.astype(np.float64)
+    if z_raw.max() > 1.0:
+        # Normalize to 0-1
+        z_norm = (z_raw - z_raw.min()) / (z_raw.max() - z_raw.min() + 1e-8)
+        # Map to metric range using inverse logic: 1/depth
+        # High intensity (255) = close, Low intensity (0) = far
+        inv_min, inv_max = 1.0/d_min, 1.0/d_max
+        z = 1.0 / (inv_max + (1.0 - z_norm) * (inv_min - inv_max))
+    else:
+        z = z_raw
+
     h, w = z.shape
     v_idx, u_idx = np.meshgrid(np.arange(h), np.arange(w), indexing="ij")
 
-    # Mask invalid pixels
-    mask = (z > 0.1) & (z < depth_trunc)
+    # Mask invalid pixels + bit of margin to remove edge noise
+    mask = (z > d_min) & (z < d_max)
+    # Crop borders slightly where AI models are least accurate
+    border = 10
+    mask[:border, :] = False; mask[-border:, :] = False
+    mask[:, :border] = False; mask[:, -border:] = False
     z = z[mask]; u = u_idx[mask]; v = v_idx[mask]
 
     X = (u - cx) * z / fx
@@ -155,15 +173,43 @@ def main():
     for i, npy_path in enumerate(npy_files):
         print(f"  [{i+1}/{len(npy_files)}]  {npy_path.name}")
         depth = np.load(str(npy_path))
-        pcd   = depth_to_cloud(depth, fx, fy, cx, cy)
+        pcd   = depth_to_cloud(depth, fx, fy, cx, cy, args.depth_min, args.depth_max)
+        
+        # ── [Optimization] Downsample immediately to keep memory usage low ──
+        pcd = pcd.voxel_down_sample(args.voxel)
 
         if prev_pcd is not None and len(pcd.points) > 100:
-            T = register_icp(pcd, prev_pcd, args.voxel)
-            cumulative_T = cumulative_T @ np.linalg.inv(T)
+            # ── [Fix] Estimate normals for PointToPlane ICP ──
+            # pcd is already downsampled now
+            pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=args.voxel*3, max_nn=30))
+            
+            # prev_pcd is also already downsampled from previous iteration
+            if not prev_pcd.has_normals():
+                prev_pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=args.voxel*3, max_nn=30))
 
-        pcd.transform(cumulative_T)
-        global_cloud += pcd
-        prev_pcd = pcd
+            result = o3d.pipelines.registration.registration_icp(
+                pcd, 
+                prev_pcd,
+                max_correspondence_distance=args.voxel * 10,
+                init=np.eye(4),
+                estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane()
+            )
+
+            
+            print(f"    ICP fitness={result.fitness:.4f}  rmse={result.inlier_rmse:.4f}")
+            
+            if result.fitness > 0.5:  # Only add frame if it aligned well
+                cumulative_T = cumulative_T @ np.linalg.inv(result.transformation)
+                pcd.transform(cumulative_T)
+                global_cloud += pcd
+                prev_pcd = pcd
+            else:
+                print(f"    [!] Skipping frame {npy_path.name} - poor alignment (fitness < 0.5)")
+        else:
+            # First frame or first good frame
+            global_cloud += pcd
+            prev_pcd = pcd
+
 
     if len(global_cloud.points) == 0:
         print("  No points accumulated. Check depth map values.")

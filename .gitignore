@@ -6,3 +6,6 @@ depth_samples/
 calibration.npz
 .vscode/
 .python-version
+*.npy
+*.ply
+*.obj

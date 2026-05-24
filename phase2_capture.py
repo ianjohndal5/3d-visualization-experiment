@@ -21,7 +21,15 @@ import cv2, numpy as np
 from pathlib import Path
 
 # ── Config ────────────────────────────────────────────────────────────────────
-CAMERA_INDEX   = 0
+import argparse
+parser = argparse.ArgumentParser()
+parser.add_argument("mode",     nargs="?", default="capture", choices=["capture", "calibrate", "stream"])
+parser.add_argument("--index",  type=int, default=0, help="Camera index")
+parser.add_argument("--url",    help="IP Camera URL (e.g. http://192.168.1.15:8080/video)")
+parser.add_argument("--rotate", type=int, choices=[90, 180, 270], help="Rotate feed (90, 180, 270 degrees)")
+_args = parser.parse_known_args()[0] # Parse early to set globals
+
+CAMERA_INDEX   = _args.url if _args.url else _args.index
 CAPTURE_W      = 640          # keep low to avoid OOM on 3.5 GB RAM systems
 CAPTURE_H      = 480
 SAVE_DIR       = Path("frames")
@@ -33,34 +41,34 @@ MAX_CALIB_IMGS = 40
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def open_camera(index: int = CAMERA_INDEX) -> cv2.VideoCapture:
+def open_camera(index=CAMERA_INDEX) -> cv2.VideoCapture:
     """
-    Open a camera, auto-scanning all /dev/video* devices if the requested
-    index fails.  Many USB cameras register two V4L2 nodes (image + metadata);
-    this finds the one that actually delivers frames.
+    Open a camera. Supports integer indices or URL strings for network cameras.
     """
     import glob, re
 
-    def _try(idx: int, backend=cv2.CAP_V4L2) -> cv2.VideoCapture | None:
-        """Return a working VideoCapture or None."""
-        cap = cv2.VideoCapture(idx, backend)
+    def _try(idx, backend=cv2.CAP_V4L2) -> cv2.VideoCapture | None:
+        # For URL strings, don't use CAP_V4L2 
+        actual_backend = 0 if isinstance(idx, str) else backend
+        cap = cv2.VideoCapture(idx, actual_backend)
         if not cap.isOpened():
             return None
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CAPTURE_W)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAPTURE_H)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
-        # Verify we can actually read a frame (not just open the fd)
         ok, _ = cap.read()
-        if ok:
+        if ok or isinstance(idx, str): # URLs might need a second to buffer
             return cap
         cap.release()
         return None
 
-    # 1. Try the requested index first
-    cap = _try(index) or _try(index, 0)
-    if cap:
-        print(f"  Camera opened at index {index}")
-        return cap
+    # If it's a URL, just try it once
+    if isinstance(index, str):
+        print(f"  Attempting to open network camera: {index}")
+        cap = _try(index)
+        if cap: return cap
+        raise RuntimeError(f"Could not connect to URL: {index}")
+
 
     # 2. Auto-scan /dev/video0 … /dev/video9
     video_nodes = sorted(glob.glob("/dev/video?"))
@@ -121,8 +129,21 @@ def mode_capture():
         if not ret:
             print("Frame grab failed - check camera connection.")
             break
+        
+        # ── [Rotation Fix] Correct orientation if requested ──
+        if _args.rotate == 90:
+            frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+        elif _args.rotate == 180:
+            frame = cv2.rotate(frame, cv2.ROTATE_180)
+        elif _args.rotate == 270:
+            frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
         out = draw_overlay(frame, f"LIVE  |  saved:{idx}  |  s=save  q=quit")
+        
+        # ── [Window Fix] Ensure the window is resizable and starts small ──
+        cv2.namedWindow("3D Scanner - Capture", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("3D Scanner - Capture", 640, 480)
+        
         cv2.imshow("3D Scanner - Capture", out)
         key = cv2.waitKey(30) & 0xFF       # 30 ms → ~33 fps max, reduces CPU/RAM pressure
 
@@ -157,6 +178,7 @@ def mode_calibrate():
     used = 0
     for path in imgs[:MAX_CALIB_IMGS]:
         img  = cv2.imread(str(path))
+        if img is None: continue
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         ok, corners = cv2.findChessboardCorners(gray, (CHESS_COLS, CHESS_ROWS), flags)
         symbol = "✓" if ok else "✗"
@@ -180,7 +202,12 @@ def mode_calibrate():
         sys.exit(f"\nNeed ≥6 good frames; only {used} found. "
                  "Capture more chessboard images (try different angles/distances).")
 
-    h, w = cv2.imread(str(imgs[0])).shape[:2]
+    test_img = cv2.imread(str(imgs[0]))
+    if test_img is None:
+        sys.exit("Could not read calibration images.")
+    h, w = test_img.shape[:2]
+    
+    # Cast to float32/int to satisfy linter overloads
     rms, K, dist, *_ = cv2.calibrateCamera(obj_pts, img_pts, (w, h), None, None)
 
     np.savez(str(CALIBRATION), K=K, dist=dist, rms=float(rms), w=w, h=h)

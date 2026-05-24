@@ -30,11 +30,14 @@ parser = argparse.ArgumentParser()
 parser.add_argument("mode",    nargs="?", default="mono",
                     choices=["mono", "stereo", "realsense"],
                     help="Depth estimation mode")
-parser.add_argument("--save",  action="store_true",
-                    help="Save sample depth maps to depth_samples/")
+parser.add_argument("--index",  type=int, default=0, help="Camera index")
+parser.add_argument("--url",    help="IP Camera URL (e.g. http://192.168.1.15:8080/video)")
+parser.add_argument("--save",   action="store_true", help="Save depth map as .npy and .png")
 args = parser.parse_args()
 
-SAVE_DIR = Path("depth_samples")
+CAMERA_INDEX = args.url if args.url else args.index
+SAVE_DIR     = Path("depth_samples")
+
 CALIBRATION = Path("calibration.npz")
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -49,7 +52,7 @@ def depth_to_colormap(depth: np.ndarray) -> np.ndarray:
     if valid.size:
         d = np.clip(d, valid.min(), valid.max())
         d = (d - d.min()) / (d.max() - d.min() + 1e-8)
-    rgba = (_cmap(d) * 255).astype(np.uint8)   # RGBA
+    rgba = (np.array(_cmap(d)) * 255).astype(np.uint8)   # RGBA
     return cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGR)
 
 
@@ -75,20 +78,58 @@ def run_mono():
         print("torch / transformers not installed. Run:  pip install torch transformers")
         sys.exit(1)
 
-    print("Loading Depth-Anything v2 small …")
+    print("Loading Depth-Anything v2 Base (Higher Precision) …")
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    # Uses the depth-estimation HF pipeline backed by DepthAnything V2
+    # Upgraded to 'Base' model for much better definition of small objects
     pipe = hf_pipeline(
         "depth-estimation",
-        model="depth-anything/Depth-Anything-V2-Small-hf",
+        model="depth-anything/Depth-Anything-V2-Base-hf",
         device=0 if device == "cuda" else -1,
     )
     print(f"  Model loaded on {device.upper()}.  Press 'q' to quit.")
 
-    cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
+    # ── [New] Process saved frames if they exist ──
+    input_dir = Path("frames")
+    saved_frames = sorted(input_dir.glob("frame_*.png"))
+    
+    if saved_frames and not args.url:
+        print(f"Found {len(saved_frames)} saved frames in '{input_dir}'. Processing offline...")
+        for i, img_path in enumerate(saved_frames):
+            bgr = cv2.imread(str(img_path))
+            if bgr is None: continue
+            
+            # Convert to PIL RGB for the pipeline
+            from PIL import Image as PILImage
+            rgb_pil = PILImage.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+            result   = pipe(rgb_pil)
+            depth_np = np.array(result["depth"], dtype=np.float32)
+            
+            # ── [AI Improvement] Edge-preserving smoothing ──
+            # This helps define the shape and reduces "blobbiness"
+            depth_np = cv2.bilateralFilter(depth_np, d=5, sigmaColor=0.1, sigmaSpace=5)
+            
+            save_depth(depth_np, "mono", i)
+            
+            heatmap = depth_to_colormap(depth_np)
+            cv2.imshow("3D Scanner - Processing Depth", np.hstack([bgr, heatmap]))
+            if cv2.waitKey(1) & 0xFF == ord('q'): break
+        print("Offline processing complete.")
+        cv2.destroyAllWindows()
+        return
+
+    # ── Fallback to Live Feed ──
+    print(f"Opening camera feed: {CAMERA_INDEX}")
+    backend = 0 if isinstance(CAMERA_INDEX, str) else cv2.CAP_V4L2
+    cap = cv2.VideoCapture(CAMERA_INDEX, backend)
+    
+    if not cap.isOpened():
+        print(f"Error: Could not open camera: {CAMERA_INDEX}")
+        return
+
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)   # 1-frame buffer → less RAM
+    cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
+
 
     frame_idx = 0
     fps_t = time.time()
@@ -233,7 +274,10 @@ def run_realsense():
                 break
             frame_idx += 1
     finally:
-        pipe.stop()
+        try:
+            pipe.stop()
+        except:
+            pass
         cv2.destroyAllWindows()
 
 
